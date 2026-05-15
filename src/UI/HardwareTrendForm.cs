@@ -73,7 +73,7 @@ namespace LiteMonitor
             Text = LanguageManager.T("Menu.MonitorHistory");
             Size = new Size(S(980), S(680));
             MinimumSize = new Size(S(900), S(620));
-            StartPosition = FormStartPosition.CenterScreen;
+            StartPosition = FormStartPosition.Manual;
             BackColor = C_Back;
             ForeColor = C_TextMain;
             Font = new Font("Microsoft YaHei UI", 9F);
@@ -115,6 +115,21 @@ namespace LiteMonitor
             _timer = new System.Windows.Forms.Timer { Interval = 15000 };
             _timer.Tick += (_, __) => LoadData();
             _timer.Start();
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            CenterOnDesktop();
+        }
+
+        private void CenterOnDesktop()
+        {
+            // 使用桌面工作区居中，避开任务栏，同时避免默认 CenterScreen 在部分 DPI/多屏场景下偏移。
+            Rectangle workingArea = Screen.PrimaryScreen?.WorkingArea ?? SystemInformation.WorkingArea;
+            int x = workingArea.Left + (workingArea.Width - Width) / 2;
+            int y = workingArea.Top + (workingArea.Height - Height) / 2;
+            Location = new Point(Math.Max(workingArea.Left, x), Math.Max(workingArea.Top, y));
         }
 
         private Control CreateToolbar()

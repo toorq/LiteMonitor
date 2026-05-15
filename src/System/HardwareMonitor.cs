@@ -315,6 +315,7 @@ namespace LiteMonitor.src.SystemServices
                         // 这里继续加锁只会让设置页等硬件树稳定，不会拖住 CPU/MEM/DISK 首屏数据。
                         _computer.Open();
                         WarmUpMotherboardSensors();
+                        WarmUpBatterySensors();
 
                         // 先建立映射，再由正常刷新循环更新数值，避免启动时预热所有 GPU 拖慢 CPU/MEM 展示。
                         _sensorMap.Rebuild(_computer, _cfg);
@@ -371,6 +372,20 @@ namespace LiteMonitor.src.SystemServices
                 if (IsMotherboardSensorHardware(hw))
                 {
                     try { UpdateWithSubHardware(hw); }
+                    catch { }
+                }
+            }
+        }
+
+        private void WarmUpBatterySensors()
+        {
+            // 电池传感器在新版硬件库中可能需要先 Update 才会稳定暴露数值。
+            // 只预热 Battery，避免恢复启动时全硬件 Update 带来的多显卡/磁盘卡顿。
+            foreach (var hw in _computer.Hardware)
+            {
+                if (hw.HardwareType == HardwareType.Battery)
+                {
+                    try { hw.Update(); }
                     catch { }
                 }
             }
@@ -475,6 +490,7 @@ namespace LiteMonitor.src.SystemServices
                     
                     _computer.Open();
                     WarmUpMotherboardSensors();
+                    WarmUpBatterySensors();
 
                     DisableSensorHistory();
                 }
