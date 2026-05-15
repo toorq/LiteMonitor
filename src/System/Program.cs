@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Threading; // 必须引用：用于 Mutex
 using System.Windows.Forms;
+using LiteMonitor.src.Core;
 using LiteMonitor.src.SystemServices;
 
 namespace LiteMonitor
@@ -85,6 +86,11 @@ namespace LiteMonitor
             {
                 // ★★★ 3. 启动应用 ★★★
                 ApplicationConfiguration.Initialize();
+                if (!DriverInstaller.CheckPawnIOBeforeHardware(Settings.Load()))
+                {
+                    return;
+                }
+
                 Application.Run(new MainForm());
             }
             finally

@@ -92,7 +92,7 @@ namespace LiteMonitor.src.SystemServices
             _sensorMap = new SensorMap();
             _networkManager = new NetworkManager(_perfCounterManager);
             _diskManager = new DiskManager();
-            _driverInstaller = new DriverInstaller(cfg, _computer, ReloadComputerSafe);
+            _driverInstaller = new DriverInstaller(cfg, ReloadComputerSafe, ReleaseComputerForDriverInstall);
             _fpsCounter = new FpsCounter(_driverInstaller); // <--- 新增
 
             // ★★★ [修改] 2. 将 Manager 注入给 ValueProvider ★★★
@@ -501,6 +501,33 @@ namespace LiteMonitor.src.SystemServices
                 // 4. 优化 T1：重置后再次修剪内存
                 GC.Collect();
                 SystemOptimizer.TrimWorkingSet();
+            }
+            catch { }
+        }
+
+        private void ReleaseComputerForDriverInstall()
+        {
+            try
+            {
+                lock (_lock)
+                {
+                    _networkManager.ClearCache();
+                    _diskManager.ClearCache();
+                    _sensorMap.Clear();
+                    _valueProvider.ClearCache();
+                    HardwareScanner.ClearCache();
+
+                    try
+                    {
+                        _computer.Accept(new HardwareVisitor(h => { }));
+                        _computer.Close();
+                        _computer.Hardware.Clear();
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[DriverInstaller] 释放硬件监控失败: {ex.Message}");
+                    }
+                }
             }
             catch { }
         }

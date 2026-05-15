@@ -7,7 +7,6 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using LibreHardwareMonitor.Hardware;
 using LiteMonitor.src.Core;
 using Debug = System.Diagnostics.Debug;
 using LiteMonitor; // 引用 DownloadContext
@@ -17,9 +16,15 @@ namespace LiteMonitor.src.SystemServices
     public class DriverInstaller
     {
         private static readonly Version RequiredPawnIOVersion = new Version(2, 2, 0, 0);
+        private static readonly Version SafeInPlaceUpgradeVersion = new Version(2, 1, 0, 0);
+        private const int ErrorAlreadyExists = 183;
+        private const int ErrorSuccessRebootRequired = 3010;
+        private const int ErrorServiceMarkedForDelete = 1072;
+
         private readonly Settings _cfg;
-        private readonly Computer _computer;
-        private readonly Action _onReloadRequired; // 回调：通知主程序重载
+        private readonly Action? _onReloadRequired; // 回调：通知主程序重载
+        private readonly Action? _onPrepareDriverInstall; // 回调：安装驱动前释放硬件句柄
+        private bool _shouldExitAfterDriverOperation;
 
         // 建议把最快的 Gitee/国内源放在第一个
         private readonly string[] _driverPackageUrls = new[]
@@ -40,14 +45,56 @@ namespace LiteMonitor.src.SystemServices
         // 缓存当前的下载任务，避免并发重复弹窗
         private static Task<bool>? _activeDownloadTask;
         private static readonly SemaphoreSlim _downloadLock = new SemaphoreSlim(1, 1);
+        private static bool _pawnIORestartRequiredThisSession;
+        private static bool _startupPawnIOCheckCompletedThisSession;
+        private static bool _startupPawnIOCheckSawPendingDriver;
+        private static bool _runtimeLegacyPawnIOPromptShown;
 
         private bool IsChinese => _cfg?.Language?.ToLower() == "zh";
 
-        public DriverInstaller(Settings cfg, Computer computer, Action onReloadRequired)
+        public DriverInstaller(Settings cfg, Action? onReloadRequired, Action? onPrepareDriverInstall)
         {
             _cfg = cfg;
-            _computer = computer;
             _onReloadRequired = onReloadRequired;
+            _onPrepareDriverInstall = onPrepareDriverInstall;
+        }
+
+        public static bool CheckPawnIOBeforeHardware(Settings cfg)
+        {
+            PrepareLanguageForDialog(cfg);
+            var installer = new DriverInstaller(cfg, null, null);
+
+            try
+            {
+                return installer.CheckPawnIOBeforeHardwareAsync().GetAwaiter().GetResult();
+            }
+            finally
+            {
+                _startupPawnIOCheckCompletedThisSession = true;
+            }
+        }
+
+        private static void PrepareLanguageForDialog(Settings cfg)
+        {
+            if (string.IsNullOrEmpty(cfg.Language))
+            {
+                string sysLang = System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.ToLower();
+                string langPath = Path.Combine(AppContext.BaseDirectory, "resources/lang", $"{sysLang}.json");
+                cfg.Language = File.Exists(langPath) ? sysLang : "en";
+            }
+
+            LanguageManager.Load(cfg.Language);
+            cfg.SyncToLanguage();
+        }
+
+        private async Task<bool> CheckPawnIOBeforeHardwareAsync()
+        {
+            var pawnIOCheck = CheckPawnIORequirement();
+            _startupPawnIOCheckSawPendingDriver = pawnIOCheck.NeedsInstall;
+            if (!pawnIOCheck.NeedsInstall) return true;
+
+            await InstallDriverPackage(needFPS: false, pawnIOCheck, DriverInstallMode.StartupBeforeHardware).ConfigureAwait(false);
+            return !_shouldExitAfterDriverOperation;
         }
 
         // ================================================================
@@ -79,11 +126,47 @@ namespace LiteMonitor.src.SystemServices
                 // 只要 FPS 开启且文件无效，或者被强制检查且文件无效，就需要处理
                 bool needFPS = forceFpsCheck || (isFpsEnabled && !isFpsValid);
 
+                if (pawnIOCheck.NeedsInstall && _startupPawnIOCheckSawPendingDriver)
+                {
+                    if (needFPS && !isFpsValid)
+                    {
+                        _activeDownloadTask = InstallFpsComponent();
+                        return await _activeDownloadTask;
+                    }
+
+                    return false;
+                }
+
+                bool blockRuntimePawnIO = IsLegacyPawnIOUpgrade(pawnIOCheck);
+                if (blockRuntimePawnIO && _startupPawnIOCheckCompletedThisSession)
+                {
+                    if (!_runtimeLegacyPawnIOPromptShown && !_startupPawnIOCheckSawPendingDriver)
+                    {
+                        _runtimeLegacyPawnIOPromptShown = true;
+                        ShowMessageBox(IsChinese
+                                ? "检测到 PawnIO 驱动版本过旧，当前运行状态下不会卸载驱动。\n请重启 LiteMonitor，并在启动时完成驱动升级。"
+                                : "An older PawnIO driver was detected. LiteMonitor will not uninstall the driver while running.\nPlease restart LiteMonitor and complete the driver update during startup.",
+                            IsChinese ? "需要重启软件" : "Restart LiteMonitor Required",
+                            MessageBoxIcon.Information);
+                    }
+
+                    if (needFPS && !isFpsValid)
+                    {
+                        _activeDownloadTask = InstallFpsComponent();
+                        return await _activeDownloadTask;
+                    }
+
+                    return false;
+                }
+
+                if (pawnIOCheck.NeedsInstall && _pawnIORestartRequiredThisSession)
+                    return false;
+
                 if (pawnIOCheck.NeedsInstall || (needFPS && !isFpsValid))
                 {
                     _activeDownloadTask = pawnIOCheck.NeedsInstall
-                        ? InstallDriverPackage(needFPS, pawnIOCheck) // 重命名为 InstallDriverPackage
-                        : InstallFpsComponent();        // 重命名为 InstallFpsComponent
+                        ? InstallDriverPackage(needFPS, pawnIOCheck, DriverInstallMode.Runtime)
+                        : InstallFpsComponent();
                     
                     return await _activeDownloadTask;
                 }
@@ -144,7 +227,7 @@ namespace LiteMonitor.src.SystemServices
         /// <summary>
         /// 流程 B: 安装完整驱动包 (包含 PawnIO 和可选的 FPS)
         /// </summary>
-        private async Task<bool> InstallDriverPackage(bool needFPS, PawnIOCheckResult pawnIOCheck)
+        private async Task<bool> InstallDriverPackage(bool needFPS, PawnIOCheckResult pawnIOCheck, DriverInstallMode mode)
         {
             string tempZip = Path.Combine(Path.GetTempPath(), $"LiteMonitor_Drivers_{Guid.NewGuid()}.zip");
             string targetDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "resources");
@@ -168,7 +251,7 @@ namespace LiteMonitor.src.SystemServices
                 if (!ExtractZipPackage(tempZip, targetDir)) return false;
 
                 // 3. 安装 PawnIO，FPS 组件已在解压步骤中处理完成
-                return await ProcessPawnIOInstallation(targetDir);
+                return await ProcessPawnIOInstallation(targetDir, pawnIOCheck, mode);
             }
             finally
             {
@@ -225,7 +308,7 @@ namespace LiteMonitor.src.SystemServices
             }
         }
 
-        private async Task<bool> ProcessPawnIOInstallation(string searchDir)
+        private async Task<bool> ProcessPawnIOInstallation(string searchDir, PawnIOCheckResult pawnIOCheck, DriverInstallMode mode)
         {
             // 查找安装包
             string[] possibleNames = { "PawnIO_setup.exe", "pawnio.exe", "PawnIO.exe" };
@@ -247,21 +330,144 @@ namespace LiteMonitor.src.SystemServices
                 return false;
             }
 
-            // 尝试静默安装
-            bool installed = await RunPawnIOInstaller(setupPath, silent: true);
-            
-            if (!installed) 
+            bool isLegacyUpgrade = IsLegacyPawnIOUpgrade(pawnIOCheck);
+            bool legacyUninstalled = false;
+
+            if (isLegacyUpgrade)
             {
+                if (mode != DriverInstallMode.StartupBeforeHardware)
+                {
+                    Debug.WriteLine("[安装程序] 运行中检测到过旧 PawnIO，跳过卸载升级。");
+                    return false;
+                }
+
+                DriverOperationResult uninstallResult = await PrepareLegacyPawnIOUpgrade(pawnIOCheck).ConfigureAwait(false);
+                if (uninstallResult == DriverOperationResult.RestartRequired ||
+                    uninstallResult == DriverOperationResult.ServiceMarkedForDelete)
+                {
+                    _pawnIORestartRequiredThisSession = true;
+                    _shouldExitAfterDriverOperation = true;
+                    try { File.Delete(setupPath); } catch { }
+                    ShowPawnIORestartRequiredMessage(IsChinese
+                        ? "旧版 PawnIO 驱动已开始卸载，但 Windows 需要重启后才能继续安装新版驱动。"
+                        : "The old PawnIO driver started uninstalling, but Windows needs a restart before installing the new driver.");
+                    return false;
+                }
+
+                if (uninstallResult != DriverOperationResult.Success)
+                {
+                    ShowMessageBox(IsChinese
+                            ? "旧版 PawnIO 驱动自动卸载失败，本次不会继续安装新版驱动。\n请重启电脑后再打开 LiteMonitor 重试。"
+                            : "Failed to uninstall the old PawnIO driver. The new driver will not be installed now.\nPlease restart Windows and open LiteMonitor again.",
+                        IsChinese ? "驱动更新失败" : "Driver Update Failed",
+                        MessageBoxIcon.Warning);
+                    return false;
+                }
+
+                legacyUninstalled = true;
+                await Task.Delay(1500).ConfigureAwait(false);
+            }
+            else if (mode == DriverInstallMode.Runtime)
+            {
+                // 安装驱动前先关闭硬件监控树，减少当前进程占用旧驱动句柄的概率。
+                _onPrepareDriverInstall?.Invoke();
+                await Task.Delay(1000).ConfigureAwait(false);
+            }
+
+            // 尝试静默安装
+            DriverOperationResult installResult = await RunPawnIOInstaller(setupPath, silent: true);
+            
+            if (installResult == DriverOperationResult.RestartRequired)
+            {
+                _pawnIORestartRequiredThisSession = true;
+                if (mode == DriverInstallMode.StartupBeforeHardware)
+                    _shouldExitAfterDriverOperation = true;
+                try { File.Delete(setupPath); } catch { }
+                ShowPawnIORestartRequiredMessage(IsChinese
+                    ? "PawnIO 驱动更新已完成，但需要重启电脑后才能生效。"
+                    : "PawnIO driver update completed, but Windows needs a restart before it takes effect.");
+                return true;
+            }
+
+            if (installResult == DriverOperationResult.ServiceMarkedForDelete)
+            {
+                _pawnIORestartRequiredThisSession = true;
+                if (mode == DriverInstallMode.StartupBeforeHardware)
+                    _shouldExitAfterDriverOperation = true;
+                ShowPawnIORestartRequiredMessage(IsChinese
+                    ? "PawnIO 驱动仍处于上一次更新未完成的状态，Windows 需要重启后才能继续安装新版驱动。"
+                    : "PawnIO is still in a pending driver update state. Windows needs a restart before installing the new driver.");
+                return false;
+            }
+
+            if (installResult == DriverOperationResult.AlreadyExists)
+            {
+                if (legacyUninstalled || mode == DriverInstallMode.StartupBeforeHardware)
+                {
+                    _pawnIORestartRequiredThisSession = true;
+                    _shouldExitAfterDriverOperation = true;
+                    ShowPawnIORestartRequiredMessage(IsChinese
+                        ? "旧版 PawnIO 驱动仍被 Windows 保留，暂时无法覆盖安装新版驱动。"
+                        : "The old PawnIO driver is still retained by Windows, so the new driver cannot be installed yet.");
+                }
+                else
+                {
+                    ShowMessageBox(IsChinese
+                            ? "检测到旧版 PawnIO 驱动仍存在，当前运行状态下无法覆盖升级。\n请重启软件，让 LiteMonitor 在启动前完成驱动升级。"
+                            : "An older PawnIO driver already exists and cannot be upgraded while LiteMonitor is running.\nPlease restart LiteMonitor so the driver can be updated before hardware monitoring starts.",
+                        IsChinese ? "需要重新启动软件" : "Restart LiteMonitor Required",
+                        MessageBoxIcon.Warning);
+                }
+
+                return false;
+            }
+
+            if (installResult == DriverOperationResult.Failed)
+            {
+                if (legacyUninstalled)
+                {
+                    _shouldExitAfterDriverOperation = true;
+                    ShowMessageBox(IsChinese
+                            ? "旧版 PawnIO 驱动已卸载，但新版驱动安装失败。\n请重启电脑后再打开 LiteMonitor 重试。"
+                            : "The old PawnIO driver was uninstalled, but the new driver installation failed.\nPlease restart Windows and open LiteMonitor again.",
+                        IsChinese ? "驱动更新未完成" : "Driver Update Incomplete",
+                        MessageBoxIcon.Warning);
+                    return false;
+                }
+
                 // 失败处理：引导手动安装
-                string msg = IsChinese 
-                    ? "PawnIO 驱动自动安装失败。\n是否立即启动手动安装？" 
+                string msg = IsChinese
+                    ? "PawnIO 驱动自动安装失败。\n是否立即启动手动安装？"
                     : "PawnIO driver installation failed.\nLaunch manual installation now?";
                 
                 if (MessageBox.Show(msg, IsChinese ? "需要协助" : "Help", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
                 {
-                    await RunPawnIOInstaller(setupPath, silent: false);
+                    DriverOperationResult manualResult = await RunPawnIOInstaller(setupPath, silent: false);
                     
-                    if (IsPawnIOReadyAfterInstall())
+                    if (manualResult == DriverOperationResult.RestartRequired)
+                    {
+                        _pawnIORestartRequiredThisSession = true;
+                        if (mode == DriverInstallMode.StartupBeforeHardware)
+                            _shouldExitAfterDriverOperation = true;
+                        try { File.Delete(setupPath); } catch { }
+                        ShowPawnIORestartRequiredMessage(IsChinese
+                            ? "PawnIO 驱动安装已完成，但需要重启电脑后才能生效。"
+                            : "PawnIO driver installation completed, but Windows needs a restart before it takes effect.");
+                        return true;
+                    }
+
+                    if (manualResult == DriverOperationResult.ServiceMarkedForDelete)
+                    {
+                        _pawnIORestartRequiredThisSession = true;
+                        if (mode == DriverInstallMode.StartupBeforeHardware)
+                            _shouldExitAfterDriverOperation = true;
+                        ShowPawnIORestartRequiredMessage(IsChinese
+                            ? "PawnIO 驱动仍处于上一次更新未完成的状态，Windows 需要重启后才能继续安装新版驱动。"
+                            : "PawnIO is still in a pending driver update state. Windows needs a restart before installing the new driver.");
+                        return false;
+                    }
+
+                    if (manualResult == DriverOperationResult.Success || IsPawnIOReadyAfterInstall())
                     {
                         ShowMessageBox(IsChinese ? "PawnIO 驱动已安装。请重启软件。" : "PawnIO driver installed. Please restart.", 
                                        IsChinese ? "安装成功" : "Success", MessageBoxIcon.Information);
@@ -276,6 +482,7 @@ namespace LiteMonitor.src.SystemServices
                     }
                 }
 
+                _onReloadRequired?.Invoke();
                 return false;
             }
             else
@@ -292,6 +499,13 @@ namespace LiteMonitor.src.SystemServices
         private bool IsPawnIORequiredByConfig()
         {
             return _cfg.IsAnyEnabled("CPU");
+        }
+
+        private bool IsLegacyPawnIOUpgrade(PawnIOCheckResult pawnIOCheck)
+        {
+            return pawnIOCheck.Status == PawnIOCheckStatus.Outdated &&
+                   pawnIOCheck.Installation.Version != null &&
+                   pawnIOCheck.Installation.Version < SafeInPlaceUpgradeVersion;
         }
 
         private PawnIOCheckResult CheckPawnIORequirement()
@@ -324,15 +538,17 @@ namespace LiteMonitor.src.SystemServices
 
                     installed = true;
                     string? versionText = key.GetValue("DisplayVersion") as string;
+                    string? quietUninstall = key.GetValue("QuietUninstallString") as string;
+                    string? uninstall = key.GetValue("UninstallString") as string;
                     if (string.IsNullOrWhiteSpace(firstVersionText)) firstVersionText = versionText;
 
                     if (TryParseVersion(versionText, out var version))
-                        return new PawnIOInstallationInfo(true, version, versionText);
+                        return new PawnIOInstallationInfo(true, version, versionText, quietUninstall, uninstall);
                 }
             }
             catch { }
 
-            return new PawnIOInstallationInfo(installed, null, firstVersionText);
+            return new PawnIOInstallationInfo(installed, null, firstVersionText, null, null);
         }
 
         private bool IsPawnIOReadyAfterInstall()
@@ -349,6 +565,54 @@ namespace LiteMonitor.src.SystemServices
             version = null;
             if (string.IsNullOrWhiteSpace(versionText)) return false;
             return Version.TryParse(versionText.Trim(), out version);
+        }
+
+        private async Task<DriverOperationResult> PrepareLegacyPawnIOUpgrade(PawnIOCheckResult pawnIOCheck)
+        {
+            string? uninstallCommand = pawnIOCheck.Installation.QuietUninstallString ?? pawnIOCheck.Installation.UninstallString;
+            if (string.IsNullOrWhiteSpace(uninstallCommand)) return DriverOperationResult.Failed;
+
+            return await RunPawnIOUninstaller(uninstallCommand).ConfigureAwait(false);
+        }
+
+        private async Task<DriverOperationResult> RunPawnIOUninstaller(string commandLine)
+        {
+            if (!TrySplitCommandLine(commandLine, out string fileName, out string arguments))
+                return DriverOperationResult.Failed;
+
+            if (!arguments.Contains("-silent", StringComparison.OrdinalIgnoreCase))
+                arguments = string.IsNullOrWhiteSpace(arguments) ? "-silent" : $"{arguments} -silent";
+
+            return await RunPawnIOProcess(fileName, arguments, silent: true, checkReadyAfterExit: false).ConfigureAwait(false);
+        }
+
+        private static bool TrySplitCommandLine(string commandLine, out string fileName, out string arguments)
+        {
+            fileName = "";
+            arguments = "";
+            commandLine = commandLine.Trim();
+            if (string.IsNullOrWhiteSpace(commandLine)) return false;
+
+            if (commandLine[0] == '"')
+            {
+                int endQuote = commandLine.IndexOf('"', 1);
+                if (endQuote <= 1) return false;
+
+                fileName = commandLine.Substring(1, endQuote - 1);
+                arguments = commandLine.Substring(endQuote + 1).Trim();
+                return !string.IsNullOrWhiteSpace(fileName);
+            }
+
+            int firstSpace = commandLine.IndexOf(' ');
+            if (firstSpace < 0)
+            {
+                fileName = commandLine;
+                return true;
+            }
+
+            fileName = commandLine.Substring(0, firstSpace);
+            arguments = commandLine.Substring(firstSpace + 1).Trim();
+            return !string.IsNullOrWhiteSpace(fileName);
         }
 
         private string GetPawnIODialogTitle(PawnIOCheckResult check)
@@ -407,7 +671,13 @@ namespace LiteMonitor.src.SystemServices
             catch { return false; }
         }
 
-        private async Task<bool> RunPawnIOInstaller(string installerPath, bool silent = true)
+        private async Task<DriverOperationResult> RunPawnIOInstaller(string installerPath, bool silent = true)
+        {
+            string arguments = silent ? "-install -silent" : "";
+            return await RunPawnIOProcess(installerPath, arguments, silent, checkReadyAfterExit: true);
+        }
+
+        private async Task<DriverOperationResult> RunPawnIOProcess(string fileName, string arguments, bool silent, bool checkReadyAfterExit)
         {
             int maxRetries = 3;
             for (int i = 0; i < maxRetries; i++)
@@ -416,8 +686,8 @@ namespace LiteMonitor.src.SystemServices
                 {
                     var psi = new ProcessStartInfo
                     {
-                        FileName = installerPath,
-                        Arguments = silent ? "-install -silent" : "",
+                        FileName = fileName,
+                        Arguments = arguments,
                         UseShellExecute = true,
                         Verb = "runas",
                         WindowStyle = silent ? ProcessWindowStyle.Hidden : ProcessWindowStyle.Normal
@@ -427,9 +697,23 @@ namespace LiteMonitor.src.SystemServices
                     if (proc != null)
                     {
                         await proc.WaitForExitAsync();
+                        Debug.WriteLine($"[安装程序] {Path.GetFileName(fileName)} 退出码: {proc.ExitCode}");
+
+                        if (silent && proc.ExitCode == ErrorAlreadyExists)
+                            return DriverOperationResult.AlreadyExists;
                         
-                        // 1. 优先判断 ExitCode (仅静默模式下完全可信)
-                        if (silent && proc.ExitCode == 0 && IsPawnIOReadyAfterInstall()) return true;
+                        if (silent && proc.ExitCode == ErrorSuccessRebootRequired)
+                            return DriverOperationResult.RestartRequired;
+
+                        if (silent && proc.ExitCode == ErrorServiceMarkedForDelete)
+                            return DriverOperationResult.ServiceMarkedForDelete;
+
+                        // 1. 优先判断 ExitCode。新版 PawnIO CLI 返回 DOS 错误码，0 表示操作成功。
+                        if (silent && proc.ExitCode == 0 && !checkReadyAfterExit)
+                            return DriverOperationResult.Success;
+
+                        if (silent && proc.ExitCode == 0 && IsPawnIOReadyAfterInstall())
+                            return DriverOperationResult.Success;
                     }
                 }
                 catch (Exception ex)
@@ -439,10 +723,10 @@ namespace LiteMonitor.src.SystemServices
 
                 // 2. 等待 2 秒后检查注册表 (解决安装延迟或ExitCode不准的问题)
                 await Task.Delay(2000);
-                if (IsPawnIOReadyAfterInstall())
+                if (checkReadyAfterExit && IsPawnIOReadyAfterInstall())
                 {
                     Debug.WriteLine("[安装程序] 通过注册表验证安装成功。");
-                    return true;
+                    return DriverOperationResult.Success;
                 }
                 
                 // 如果是手动模式，只尝试一次，不进行循环重试（用户关闭窗口算结束）
@@ -454,7 +738,31 @@ namespace LiteMonitor.src.SystemServices
                     Debug.WriteLine("[安装程序] 正在重试安装...");
                 }
             }
-            return false;
+            return DriverOperationResult.Failed;
+        }
+
+        private void ShowPawnIORestartRequiredMessage(string description)
+        {
+            ShowMessageBox(description + (IsChinese
+                    ? "\n请重启电脑后再打开 LiteMonitor。"
+                    : "\nPlease restart Windows before opening LiteMonitor again."),
+                IsChinese ? "需要重启" : "Restart Required",
+                MessageBoxIcon.Information);
+        }
+
+        private enum DriverOperationResult
+        {
+            Failed,
+            Success,
+            AlreadyExists,
+            RestartRequired,
+            ServiceMarkedForDelete
+        }
+
+        private enum DriverInstallMode
+        {
+            Runtime,
+            StartupBeforeHardware
         }
 
         private enum PawnIOCheckStatus
@@ -480,16 +788,20 @@ namespace LiteMonitor.src.SystemServices
 
         private sealed class PawnIOInstallationInfo
         {
-            public PawnIOInstallationInfo(bool installed, Version? version, string? versionText)
+            public PawnIOInstallationInfo(bool installed, Version? version, string? versionText, string? quietUninstallString, string? uninstallString)
             {
                 Installed = installed;
                 Version = version;
                 VersionText = versionText;
+                QuietUninstallString = quietUninstallString;
+                UninstallString = uninstallString;
             }
 
             public bool Installed { get; }
             public Version? Version { get; }
             public string? VersionText { get; }
+            public string? QuietUninstallString { get; }
+            public string? UninstallString { get; }
         }
 
         private void ShowMessageBox(string msg, string title, MessageBoxIcon icon)
