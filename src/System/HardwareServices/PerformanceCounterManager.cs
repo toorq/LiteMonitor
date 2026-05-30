@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 
@@ -33,7 +34,21 @@ namespace LiteMonitor.src.SystemServices
 
         // --- 静态基准数据 (启动时获取一次即可) ---
         private float _cpuBaseFreq = 0;   // CPU 基准频率 (MHz)
+        private float _cpuMaxFreq = 0;    // CPU 最大睿频 (MHz)，用于模拟任务管理器归一化
         private float _totalMemoryMB = 0; // 物理内存总量 (MB)
+
+        // --- 动态学习：观察 % Processor Performance 的历史峰值 ---
+        // 任务管理器内部用的是 "当前频率 / 最大频率"，最大频率必须包含睿频。
+        // WMI MaxClockSpeed 在大多数 Intel/AMD CPU 上返回的是 base，不是 turbo。
+        // 因此运行时不断观察 % Processor Performance（=当前频率/基准频率*100）的峰值，
+        // 用它折算出真实的最大睿频比，比纯静态读 WMI 更准。
+        private float _maxObservedPerfPercent = 100f; // 至少 100% (=base)
+
+        // 单 tick 缓存：同一个采样周期内，% Processor Performance 只读一次
+        // 防止 GetCpuLoad() 与 GetCpuFreq() 各读一次造成差分计数器抖动
+        private float? _perfPercentCache = null;
+        private long _perfPercentCacheTick = 0;
+        private const long PerfPercentCacheValidMs = 200; // 200ms 内复用
 
         /// <summary>
         /// 标记计数器是否已完成初始化和预热。
@@ -163,6 +178,30 @@ namespace LiteMonitor.src.SystemServices
             // 兜底策略：如果读不到，设为 2.5GHz，防止除零错误
             if (_cpuBaseFreq <= 0) _cpuBaseFreq = 2500; 
 
+            // A2. 获取 CPU 最大频率 (WMI Win32_Processor.MaxClockSpeed)
+            // 注意：该字段在大多数现代 CPU 上返回的就是基准频率(标称值)，不是真正的 Turbo。
+            // 因此此处仅作为兜底；真正的最大频率会在运行期通过观察 % Processor Performance 的峰值学习。
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    using var searcher = new ManagementObjectSearcher("SELECT MaxClockSpeed FROM Win32_Processor");
+                    foreach (var obj in searcher.Get())
+                    {
+                        var raw = obj["MaxClockSpeed"];
+                        if (raw != null && uint.TryParse(raw.ToString(), out var mhz) && mhz > 0)
+                        {
+                            _cpuMaxFreq = mhz;
+                        }
+                        obj.Dispose();
+                        break;
+                    }
+                }
+            }
+            catch { }
+            // 如果 WMI 读不到，先用 base 频率，等待运行期校正
+            if (_cpuMaxFreq < _cpuBaseFreq) _cpuMaxFreq = _cpuBaseFreq;
+
             // B. 获取物理内存总量 (调用 Win32 API GlobalMemoryStatusEx)
             try
             {
@@ -184,20 +223,66 @@ namespace LiteMonitor.src.SystemServices
         public float? GetCpuLoad()
         {
             var val = SafeRead(_cpuLoadCounter);
-            // [Fix] Utility 计数器在睿频时可能超过 100%，需截断以匹配任务管理器行为
-            return val > 100f ? 100f : val;
+            if (!val.HasValue) return null;
+
+            // ★ 模拟任务管理器的归一化 ★
+            // taskmgr 显示公式 ≈ % Processor Time × (当前频率 / 最大频率)
+            //                  = % Processor Utility × (基准频率 / 最大频率)
+            // 因为 % Processor Utility ≈ % Processor Time × (当前频率 / 基准频率)
+            //
+            // 关键是拿到"最大频率"。WMI 通常只给基准频率，所以这里同时观察
+            // % Processor Performance 的历史峰值，动态学习真正的最大睿频比。
+            ReadPerfPercentCached();
+
+            // 计算归一化系数：基准频率 / 最大频率 (≤ 1)
+            float scale = 1f;
+            if (_cpuMaxFreq > 0 && _cpuBaseFreq > 0 && _cpuMaxFreq > _cpuBaseFreq)
+            {
+                scale = _cpuBaseFreq / _cpuMaxFreq;
+            }
+
+            float normalized = val.Value * scale;
+            // 截断到 [0, 100]
+            if (normalized < 0f) normalized = 0f;
+            if (normalized > 100f) normalized = 100f;
+            return normalized;
         }
 
         public float? GetCpuFreq()
         {
             // 算法：基准频率 * (性能百分比 / 100)
             // 例子：基准 3.0GHz * 150% = 4.5GHz
-            var percent = SafeRead(_cpuFreqCounter);
+            var percent = ReadPerfPercentCached();
             if (percent.HasValue && _cpuBaseFreq > 0)
             {
                 return _cpuBaseFreq * (percent.Value / 100.0f);
             }
             return null;
+        }
+
+        /// <summary>
+        /// 读取 % Processor Performance 并带 200ms 缓存。
+        /// 同时更新 _maxObservedPerfPercent / _cpuMaxFreq，用于 CPU 负载的归一化。
+        /// </summary>
+        private float? ReadPerfPercentCached()
+        {
+            long now = Environment.TickCount64;
+            if (_perfPercentCache.HasValue && now - _perfPercentCacheTick < PerfPercentCacheValidMs)
+            {
+                return _perfPercentCache;
+            }
+
+            var percent = SafeRead(_cpuFreqCounter);
+            _perfPercentCache = percent;
+            _perfPercentCacheTick = now;
+
+            if (percent.HasValue && percent.Value > _maxObservedPerfPercent && percent.Value < 400f)
+            {
+                _maxObservedPerfPercent = percent.Value;
+                float learnedMax = _cpuBaseFreq * (percent.Value / 100f);
+                if (learnedMax > _cpuMaxFreq) _cpuMaxFreq = learnedMax;
+            }
+            return percent;
         }
 
         /// <summary>
